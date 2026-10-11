@@ -1,0 +1,14 @@
+# Output binaries
+bin/
+obj/
+*.log
+*.bak
+*.old*
+*.exe
+!bin/pcfix-scanner.exe
+
+# OS / Editor
+.vs/
+.vscode/
+Thumbs.db
+desktop.ini
