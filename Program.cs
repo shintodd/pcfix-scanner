@@ -81,26 +81,46 @@ namespace PcfixScanner
             SmartHealthStatus = "Unknown";
         }
 
-        public bool IsFailing
+        // Verified physical drive death (Tier 1): severe wear, SMART unhealthy, uncorrectable
+        // errors, or a predictive-failure status flag. Bad block read retries are NOT death.
+        public bool IsSsdDeath
         {
             get
             {
-                return BadBlockCount > 0
-                    || Status != "OK"
-                    || SmartHealthStatus == "Unhealthy"
-                    || (SmartReadErrorsUncorrected ?? 0) > 0;
+                if (SmartWearPercent.HasValue && SmartWearPercent.Value >= 95) return true;
+                if (SmartHealthStatus == "Unhealthy") return true;
+                if ((SmartReadErrorsUncorrected ?? 0) > 0) return true;
+                if (Status != null &&
+                    (Status.IndexOf("Pred Fail", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                     Status.IndexOf("Error", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                     Status.IndexOf("Degraded", StringComparison.OrdinalIgnoreCase) >= 0)) return true;
+                return false;
             }
+        }
+
+        public bool IsFailing
+        {
+            get { return IsSsdDeath; }
+        }
+
+        public bool HasReadRetries
+        {
+            get { return BadBlockCount > 0; }
         }
 
         public string GetHealthBadge()
         {
-            if (BadBlockCount > 0)
+            if (IsSsdDeath)
             {
-                return string.Format("CRITICAL FAILURE ({0:N0} Bad Blocks)", BadBlockCount);
-            }
-            if (SmartHealthStatus == "Unhealthy" || (SmartReadErrorsUncorrected ?? 0) > 0)
-            {
-                return string.Format("CRITICAL FAILURE (SMART Unhealthy, {0} Uncorrected Errors)", SmartReadErrorsUncorrected ?? 0);
+                if (SmartHealthStatus == "Unhealthy" || (SmartReadErrorsUncorrected ?? 0) > 0)
+                {
+                    return string.Format("CRITICAL FAILURE (SMART Unhealthy, {0} Uncorrected Errors)", SmartReadErrorsUncorrected ?? 0);
+                }
+                if (SmartWearPercent.HasValue && SmartWearPercent.Value >= 95)
+                {
+                    return string.Format("CRITICAL FAILURE ({0}% Wear)", SmartWearPercent.Value);
+                }
+                return string.Format("CRITICAL FAILURE ({0})", Status);
             }
             if (Status != "OK")
             {
@@ -110,11 +130,15 @@ namespace PcfixScanner
             {
                 return "WARNING (SMART Predictive Failure)";
             }
+            if (BadBlockCount > 0)
+            {
+                return string.Format("DEGRADED ({0:N0} Read Retries)", BadBlockCount);
+            }
             if (SmartHealthStatus == "Healthy")
             {
-                return "HEALTHY (0 Bad Blocks, SMART Verified)";
+                return "HEALTHY (SMART Verified)";
             }
-            return "HEALTHY (0 Bad Blocks, SMART Unavailable)";
+            return "HEALTHY (SMART Unavailable)";
         }
     }
 
@@ -1083,6 +1107,13 @@ namespace PcfixScanner
         public string PcfixScoreLabel { get; set; }
         public List<string> PcfixDeductions { get; set; }
 
+        // Phase 4: three-tier severity classification + operational status reality check.
+        public string PcfixTier { get; set; }
+        public string OperationalStatusText { get; set; }
+        public string VerdictLabel { get; set; }
+        public string VerdictAdvice { get; set; }
+        public string SoftwareStability { get; set; }
+
         public HardwareReport()
         {
             Cpu = "Querying...";
@@ -1137,39 +1168,67 @@ namespace PcfixScanner
             SmartSource = "Unavailable";
             PcfixScoreLabel = "Not scored";
             PcfixDeductions = new List<string>();
+            PcfixTier = "Unknown";
+            OperationalStatusText = "";
+            VerdictLabel = "";
+            VerdictAdvice = "";
+            SoftwareStability = "No application crashes recorded";
         }
 
-        public bool HasCriticalHardwareFailure
+        // Tier 1 critical: verified physical hardware failure only. Bad block read retries,
+        // split-boot, XMP-off, app crashes, and CMOS drift are explicitly NOT here.
+        public bool HasTier1HardwareFault
+        {
+            get
+            {
+                if (WheaCount > 0) return true;
+                if (MemDiagFailed) return true;
+                if (Disks.Exists(d => d.IsSsdDeath)) return true;
+                if (KernelPowerStopCode != null && KernelPowerStopCode.Length > 0)
+                {
+                    if (KernelPowerStopCode.IndexOf("0x124", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+                    if (KernelPowerStopCode.IndexOf("0x7A", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+                    if (KernelPowerStopCode.IndexOf("0x1A", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+                }
+                return false;
+            }
+        }
+
+        // Tier 2 maintenance: degraded but not crashing. Read retries, thermals, driver TDR.
+        public bool HasTier2Maintenance
         {
             get
             {
                 return BadBlockTotal > 0
-                    || WheaCount > 0
-                    || MemDiagFailed
+                    || CpuThrottleCount > 0
+                    || DisplayTdrCount > 0
                     || NtfsCorruptionEvents > 0
-                    || (PnpDeviceErrors.Exists(p => p.IndexOf("Code 43", StringComparison.OrdinalIgnoreCase) >= 0))
-                    || (BugCheckStopCode != null && (BugCheckStopCode.IndexOf("0x124") >= 0 || BugCheckStopCode.IndexOf("0x7A") >= 0 || BugCheckStopCode.IndexOf("0x7a") >= 0))
-                    || (Disks.Exists(d => d.IsFailing));
+                    || (Disks.Exists(d => d.Status != "OK" && !d.IsSsdDeath))
+                    || (Disks.Exists(d => d.SmartHealthStatus == "Warning"));
             }
+        }
+
+        // Kept for back-compat: the UI alert card treats tier 1 as the red "critical" branch.
+        public bool HasCriticalHardwareFailure
+        {
+            get { return HasTier1HardwareFault; }
         }
 
         public bool HasWarningCondition
         {
             get
             {
-                return DisplayTdrCount > 0
-                    || KernelPowerEvents >= 2
+                return HasTier2Maintenance
                     || SplitBootDetected
+                    || XmpDisabledSuspected
+                    || CmosClockDriftDetected
                     || BugCheckCount > 0
-                    || CpuThrottleCount > 0
                     || PnpDeviceErrors.Count > 0
                     || LowMemoryEvents > 0
-                    || CmosClockDriftDetected
                     || DeadAutoServices.Count > 0
                     || !SsdTrimEnabled
-                    || (SystemReliabilityScore >= 0 && SystemReliabilityScore < 5.0)
-                    || XmpDisabledSuspected
-                    || (Disks.Exists(d => d.Status != "OK" || d.SmartHealthStatus == "Warning"));
+                    || AppCrashes > 0
+                    || (SystemReliabilityScore >= 0 && SystemReliabilityScore < 5.0);
             }
         }
 
@@ -1181,11 +1240,13 @@ namespace PcfixScanner
         // composite metric); this one uses only the raw telemetry already
         // collected in PerformDeepHardwareScan().
         //
-        //   -35  Active disk bad blocks (Event 7/153) or NVMe wear >= 90%
-        //   -25  Kernel-Power Event 41 or WHEA hardware errors (past 7 days)
-        //   -20  Split-boot detected (dangerous dual-drive boot dependency)
-        //   -15  CPU thermal/firmware throttling (Kernel-Processor-Power Event 37)
-        //   -10  RAM running at JEDEC base while XMP/EXPO profile disabled
+        //   -40  WHEA machine check events (Event 18/19/47)
+        //   -35  Windows Memory Diagnostic failure (Event 1201) or SSD death
+        //   -30  Kernel-Power 41 bugcheck 0x124/0x7A/0x1A
+        //   -20  disk bad block read retries (Event 7/51/153)
+        //   -12  CPU thermal/firmware throttling (Event 37)
+        //   -10  display driver TDR resets (Event 4101)
+        //    -5  split-boot layout / XMP off / CMOS drift (advisories)
         //
         // Called once after PerformDeepHardwareScan() populates all fields.
         // Detects RAM sticks populated in the same memory channel (single-channel mode with 2+ sticks),
@@ -1222,65 +1283,165 @@ namespace PcfixScanner
             int score = 100;
             PcfixDeductions = new List<string>();
 
-            // -35: Disk bad blocks or NVMe endurance near limit
-            bool diskBad = BadBlockTotal > 0;
-            bool wearCrit = false;
+            // ---- TIER 1: CRITICAL HARDWARE FAULTS (verified physical failure) ----
+            bool wheaFault = WheaCount > 0;
+            bool memFault = MemDiagFailed;
+            bool kpCritical = false;
+            if (KernelPowerStopCode != null)
+            {
+                if (KernelPowerStopCode.IndexOf("0x124", StringComparison.OrdinalIgnoreCase) >= 0) kpCritical = true;
+                if (KernelPowerStopCode.IndexOf("0x7A", StringComparison.OrdinalIgnoreCase) >= 0) kpCritical = true;
+                if (KernelPowerStopCode.IndexOf("0x1A", StringComparison.OrdinalIgnoreCase) >= 0) kpCritical = true;
+            }
+            bool ssdDeath = false;
             foreach (DiskItem d in Disks)
             {
-                if (d.SmartWearPercent.HasValue && d.SmartWearPercent.Value >= 90)
-                {
-                    wearCrit = true;
-                    break;
-                }
+                if (d.IsSsdDeath) { ssdDeath = true; break; }
             }
-            if (diskBad || wearCrit)
+
+            if (wheaFault)
+            {
+                score -= 40;
+                PcfixDeductions.Add(string.Format("-40: {0} WHEA machine check events (Event 18/19/47). CPU bus, cache or PCIe parity fault.", WheaCount));
+            }
+            if (memFault)
             {
                 score -= 35;
-                if (diskBad && wearCrit)
-                    PcfixDeductions.Add(string.Format("-35: {0:N0} disk bad blocks AND NVMe wear >= 90%", BadBlockTotal));
-                else if (diskBad)
-                    PcfixDeductions.Add(string.Format("-35: {0:N0} disk bad block events (Event 7/51/153)", BadBlockTotal));
-                else
-                    PcfixDeductions.Add("-35: NVMe SSD nearing write wear limit (>= 90% endurance used)");
+                PcfixDeductions.Add("-35: Windows Memory Diagnostic failure (Event 1201). Defective RAM stick.");
             }
-
-            // -25: Kernel-Power 41 or WHEA hardware errors
-            if (KernelPowerEvents > 0 || WheaCount7d > 0)
+            if (ssdDeath)
             {
-                score -= 25;
-                List<string> reasons = new List<string>();
-                if (KernelPowerEvents > 0) reasons.Add(string.Format("{0} Kernel-Power 41 events", KernelPowerEvents));
-                if (WheaCount7d > 0) reasons.Add(string.Format("{0} WHEA errors", WheaCount7d));
-                PcfixDeductions.Add("-25: " + string.Join(", ", reasons.ToArray()));
+                score -= 35;
+                PcfixDeductions.Add("-35: SSD severe wear or predictive failure. Drive reported read-only or SMART wear >= 95%.");
+            }
+            if (kpCritical)
+            {
+                score -= 30;
+                PcfixDeductions.Add(string.Format("-30: Kernel-Power 41 bugcheck {0}. Power, memory or storage hardware fault.", KernelPowerStopCode));
             }
 
-            // -20: Split-boot
-            if (SplitBootDetected)
+            // ---- TIER 2: MAINTENANCE & DEGRADED STORAGE (actionable, not crash-critical) ----
+            if (BadBlockTotal > 0 && !ssdDeath)
             {
                 score -= 20;
-                PcfixDeductions.Add("-20: Split-boot detected (bootloader and Windows OS on different disks)");
+                PcfixDeductions.Add(string.Format("-20: {0:N0} bad block read retries logged (Event 7/51/153). Isolated bad sectors, not disk death.", BadBlockTotal));
             }
-
-            // -15: CPU thermal/firmware throttling
             if (CpuThrottleCount > 0)
             {
-                score -= 15;
-                PcfixDeductions.Add(string.Format("-15: {0} CPU thermal/firmware throttle events (Event 37)", CpuThrottleCount));
+                score -= 12;
+                PcfixDeductions.Add(string.Format("-12: {0} CPU thermal/firmware throttle events (Event 37).", CpuThrottleCount));
             }
-
-            // -10: XMP/EXPO disabled
-            if (XmpDisabledSuspected)
+            if (DisplayTdrCount > 0)
             {
                 score -= 10;
-                PcfixDeductions.Add(string.Format("-10: RAM at {0} MT/s, modules rated {1} MT/s (XMP/EXPO off)", RamConfiguredSpeed, RamRatedSpeed));
+                PcfixDeductions.Add(string.Format("-10: {0} display driver resets (Event 4101).", DisplayTdrCount));
+            }
+
+            // ---- TIER 3: CONFIGURATION & OPTIMIZATION ADVISORIES (non-critical) ----
+            if (SplitBootDetected)
+            {
+                score -= 5;
+                PcfixDeductions.Add("-5: Split-boot layout (boot files on a secondary disk). Configuration note, not a fault.");
+            }
+            if (XmpDisabledSuspected)
+            {
+                score -= 5;
+                PcfixDeductions.Add(string.Format("-5: RAM at {0} MT/s, modules rated {1} MT/s (XMP/EXPO off). Performance advisory.", RamConfiguredSpeed, RamRatedSpeed));
+            }
+            if (CmosClockDriftDetected)
+            {
+                score -= 5;
+                PcfixDeductions.Add("-5: RTC clock drift. Replace CR2032 coin cell on the motherboard.");
             }
 
             if (score < 0) score = 0;
             PcfixScore = score;
 
-            if (score >= 90) PcfixScoreLabel = "Optimal";
-            else if (score >= 70) PcfixScoreLabel = "Warning";
-            else PcfixScoreLabel = "Action Required";
+            // Score scale & verdict normalization.
+            if (score >= 85)
+            {
+                PcfixScoreLabel = "Optimal / Stable";
+                PcfixTier = "TIER 3";
+            }
+            else if (score >= 65)
+            {
+                PcfixScoreLabel = "Healthy / Maintenance Recommended";
+                PcfixTier = "TIER 3";
+            }
+            else if (score >= 45)
+            {
+                PcfixScoreLabel = "Degraded / Attention Required";
+                PcfixTier = "TIER 2";
+            }
+            else
+            {
+                PcfixScoreLabel = "Critical Hardware Fault";
+                PcfixTier = "TIER 1";
+            }
+
+            // Tier verdict + plain-language operational status reality check.
+            if (HasTier1HardwareFault)
+            {
+                VerdictLabel = "CRITICAL HARDWARE FAILURE DETECTED";
+                VerdictAdvice = "Replace defective component before total failure. Back up critical personal files immediately.";
+                OperationalStatusText = "OPERATIONAL STATUS: System stability at critical risk. Hardware failure confirmed.";
+                PcfixTier = "TIER 1";
+            }
+            else if (HasTier2Maintenance)
+            {
+                OperationalStatusText = "OPERATIONAL STATUS: System is currently operational. No immediate motherboard or CPU failure. Follow standard maintenance steps below.";
+                PcfixTier = "TIER 2";
+                if (BadBlockTotal > 0)
+                {
+                    VerdictLabel = "Storage Read Errors Logged";
+                    VerdictAdvice = "File corruption or isolated bad sectors detected on a disk. Run chkdsk /r and back up the affected partition.";
+                }
+                else if (CpuThrottleCount > 0)
+                {
+                    VerdictLabel = "CPU Thermal / Firmware Throttling Logged";
+                    VerdictAdvice = "Clean cooler heatsink or re-apply thermal paste.";
+                }
+                else if (DisplayTdrCount > 0)
+                {
+                    VerdictLabel = "Graphics Driver Timeout";
+                    VerdictAdvice = "Clean reinstall the GPU driver using DDU.";
+                }
+                else
+                {
+                    VerdictLabel = "Maintenance Recommended";
+                    VerdictAdvice = "Follow standard maintenance steps below.";
+                }
+            }
+            else
+            {
+                OperationalStatusText = "OPERATIONAL STATUS: System is currently operational. No immediate motherboard or CPU failure. Follow standard maintenance steps below.";
+                PcfixTier = "TIER 3";
+                if (SplitBootDetected)
+                {
+                    VerdictLabel = "Boot Configuration Note: Split-Boot Layout";
+                    VerdictAdvice = "System boots and operates normally. Boot files reside on a secondary drive. Ensure both drives stay connected.";
+                }
+                else if (XmpDisabledSuspected)
+                {
+                    VerdictLabel = "Performance Advisory: XMP/EXPO Disabled";
+                    VerdictAdvice = "Enable XMP/EXPO in BIOS for a memory bandwidth boost (optional).";
+                }
+                else
+                {
+                    VerdictLabel = "System Nominal";
+                    VerdictAdvice = "No hardware faults detected. Minor optimizations optional.";
+                }
+            }
+
+            // Software stability is a separate line item, never a hardware score deduction.
+            if (AppCrashes > 0)
+            {
+                SoftwareStability = string.Format("{0} routine application crash(es): {1}. Reinstall or update the affected program.", AppCrashes, AppCrashSummary);
+            }
+            else
+            {
+                SoftwareStability = "No application crashes recorded.";
+            }
         }
 
         // =====================================================================
@@ -1304,7 +1465,16 @@ namespace PcfixScanner
             {
                 md.AppendLine(string.Format("**Board:** {0} {1} | BIOS {2} ({3})  ", BoardManufacturer, BoardProduct, BiosVersion, BootMode));
             }
-            md.AppendLine(string.Format("**pcfix Score:** {0} / 100 ({1})", PcfixScore, PcfixScoreLabel));
+            md.AppendLine(string.Format("**pcfix Score:** {0} / 100 ({1}) [{2}]", PcfixScore, PcfixScoreLabel, PcfixTier));
+            if (!string.IsNullOrEmpty(OperationalStatusText))
+            {
+                md.AppendLine(string.Format("**{0}**", OperationalStatusText));
+            }
+            if (!string.IsNullOrEmpty(VerdictLabel))
+            {
+                md.AppendLine(string.Format("**Verdict:** {0}", VerdictLabel));
+                md.AppendLine(string.Format("**Advice:** {0}", VerdictAdvice));
+            }
             md.AppendLine();
 
             // 4-Block Matrix
@@ -1356,19 +1526,19 @@ namespace PcfixScanner
                 md.AppendLine();
             }
 
-            // Critical Alerts
+            // Critical Alerts (tier 1 physical failures only)
             List<string> alerts = new List<string>();
-            if (BadBlockTotal > 0)
+            if (BadBlockTotal > 0 && !Disks.Exists(d => d.IsSsdDeath))
             {
-                alerts.Add(string.Format("Storage media failure: {0:N0} bad block events on {1}. Drive is failing.", BadBlockTotal, BadBlockTargetDevice));
+                alerts.Add(string.Format("Storage read retries: {0:N0} logged on {1}. Run chkdsk /r and back up the affected partition.", BadBlockTotal, BadBlockTargetDevice));
             }
             foreach (DiskItem d in Disks)
             {
-                if (d.SmartWearPercent.HasValue && d.SmartWearPercent.Value >= 90)
+                if (d.IsSsdDeath)
                 {
-                    alerts.Add(string.Format("NVMe SSD nearing write wear limit: Disk {0} ({1}) at {2}% endurance used.", d.Index, d.Model, d.SmartWearPercent.Value));
+                    alerts.Add(string.Format("SSD failure: Disk {0} ({1}) reports severe wear or predictive failure. Replace drive.", d.Index, d.Model));
                 }
-                if ((d.SmartReadErrorsUncorrected ?? 0) > 0)
+                else if ((d.SmartReadErrorsUncorrected ?? 0) > 0)
                 {
                     alerts.Add(string.Format("Disk {0} ({1}) has {2} uncorrected read errors. Data loss risk.", d.Index, d.Model, d.SmartReadErrorsUncorrected));
                 }
@@ -1382,7 +1552,7 @@ namespace PcfixScanner
             if (chIssue.Length > 0) alerts.Add(chIssue);
             if (CpuThrottleCount > 0) alerts.Add(string.Format("CPU throttled {0} times. Thermal paste or cooler issue.", CpuThrottleCount));
             if (KernelPowerEvents > 0) alerts.Add(string.Format("{0} unexpected shutdown(s) in 7 days (Kernel-Power 41).", KernelPowerEvents));
-            if (DisplayTdrCount > 0) alerts.Add(string.Format("Display driver reset {0} times ({1}). GPU or driver fault.", DisplayTdrCount, DisplayTdrSummary));
+            if (DisplayTdrCount > 0) alerts.Add(string.Format("Display driver reset {0} times ({1}). Clean reinstall GPU driver with DDU.", DisplayTdrCount, DisplayTdrSummary));
             if (BugCheckCount > 0) alerts.Add(string.Format("BSOD: {0}.", BugCheckSummary));
             if (!string.IsNullOrEmpty(KernelPowerStopCode)) alerts.Add("Last Kernel-Power stop code: " + KernelPowerStopCode);
             if (PnpDeviceErrors.Count > 0) alerts.Add(string.Format("Device Manager: {0} hardware faults.", PnpDeviceErrors.Count));
@@ -1426,12 +1596,11 @@ namespace PcfixScanner
             }
             if (SplitBootDetected)
             {
-                md.AppendLine(string.Format("{0}. **Do not remove the bootloader disk.** The EFI System Partition is on a separate disk. Removing it will make Windows unbootable.", step++));
+                md.AppendLine(string.Format("{0}. **Keep both drives connected.** The EFI System Partition is on a separate disk. Removing it will make Windows unbootable.", step++));
             }
             if (DisplayTdrCount > 0)
             {
-                md.AppendLine(string.Format("{0}. **Reseat GPU.** Power off, unclip the PCIe retention latch, pull the card, blow out the slot, reinsert firmly.", step++));
-                md.AppendLine(string.Format("{0}. **Check GPU power cables.** Ensure all PCIe power connectors are fully seated.", step++));
+                md.AppendLine(string.Format("{0}. **Clean reinstall the GPU driver using DDU.** Download Display Driver Uninstaller, uninstall in Safe Mode, reinstall the latest driver.", step++));
             }
             if (CmosClockDriftDetected)
             {
@@ -1446,13 +1615,16 @@ namespace PcfixScanner
             // Event Summary
             md.AppendLine("## Event Log Summary");
             md.AppendLine();
-            md.AppendLine(string.Format("- Bad blocks (Event 7/51/153): {0:N0}", BadBlockTotal));
+            md.AppendLine(string.Format("- Bad block read retries (Event 7/51/153): {0:N0}", BadBlockTotal));
             md.AppendLine(string.Format("- Kernel-Power 41 (7 days): {0}", KernelPowerEvents));
             md.AppendLine(string.Format("- WHEA (Event 18/19/47): {0} total, {1} in 7 days", WheaCount, WheaCount7d));
             md.AppendLine(string.Format("- BugCheck BSOD (Event 1001): {0}", BugCheckCount));
             md.AppendLine(string.Format("- Display TDR (Event 4101): {0}", DisplayTdrCount));
-            md.AppendLine(string.Format("- App crashes (Event 1000): {0}", AppCrashes));
             md.AppendLine("- MiniDump: " + MiniDumpSummary);
+            md.AppendLine();
+            md.AppendLine("## Software Stability");
+            md.AppendLine();
+            md.AppendLine("- " + SoftwareStability);
             md.AppendLine();
 
             // Firmware and Security
@@ -1500,9 +1672,9 @@ namespace PcfixScanner
             foreach (DiskItem d in Disks)
             {
                 q.Append(string.Format(" D{0}:{1}({2:F0}GB)", d.Index, d.Model, d.SizeGb));
-                if (d.IsFailing) q.Append("[FAIL]");
+                if (d.IsSsdDeath) q.Append("[FAIL]");
                 else if (d.SmartHealthStatus == "Warning") q.Append("[WARN]");
-                if (d.BadBlockCount > 0) q.Append(string.Format("[BB:{0}]", d.BadBlockCount));
+                else if (d.BadBlockCount > 0) q.Append("[RETRY]");
                 if (d.SmartWearPercent.HasValue && d.SmartWearPercent.Value >= 80) q.Append(string.Format("[WEAR:{0}%]", d.SmartWearPercent.Value));
             }
             if (SplitBootDetected) q.Append(" SPLITBOOT:YES");
@@ -1547,7 +1719,7 @@ namespace PcfixScanner
             q.Append(string.Format("|d{0}", Disks.Count));
             foreach (DiskItem d in Disks)
             {
-                string st = d.IsFailing ? "F" : (d.SmartHealthStatus == "Warning" ? "W" : "O");
+                string st = d.IsSsdDeath ? "F" : (d.SmartHealthStatus == "Warning" ? "W" : (d.BadBlockCount > 0 ? "R" : "O"));
                 q.Append(string.Format("|d{0}{1}", d.Index, st));
                 if (d.BadBlockCount > 0) q.Append(string.Format(";{0}", d.BadBlockCount));
             }
@@ -1571,7 +1743,16 @@ namespace PcfixScanner
             sb.AppendLine("=== PCFIX HARDWARE REPORT ===");
             sb.AppendLine("TIMESTAMP: " + Timestamp.ToString("yyyy-MM-dd HH:mm:ss"));
             sb.AppendLine("OS: " + Os);
-            sb.AppendLine(string.Format("PCFIX_SCORE: {0}/100 ({1})", PcfixScore, PcfixScoreLabel));
+            sb.AppendLine(string.Format("PCFIX_SCORE: {0}/100 ({1}) [{2}]", PcfixScore, PcfixScoreLabel, PcfixTier));
+            if (!string.IsNullOrEmpty(OperationalStatusText))
+            {
+                sb.AppendLine(OperationalStatusText);
+            }
+            if (!string.IsNullOrEmpty(VerdictLabel))
+            {
+                sb.AppendLine("VERDICT: " + VerdictLabel);
+                sb.AppendLine("ADVICE: " + VerdictAdvice);
+            }
             if (!string.IsNullOrEmpty(BoardProduct) && BoardProduct != "Unknown")
             {
                 sb.AppendLine("BOARD: " + BoardManufacturer + " " + BoardProduct + " | BIOS " + BiosVersion + " (" + BootMode + ")");
@@ -1641,7 +1822,7 @@ namespace PcfixScanner
             if (SplitBootDetected)
             {
                 sb.AppendLine();
-                sb.AppendLine("BOOT_ARCHITECTURE: SPLIT-BOOT DETECTED");
+                sb.AppendLine("BOOT_ARCHITECTURE: BOOT CONFIGURATION NOTE (SPLIT-BOOT LAYOUT)");
                 sb.AppendLine("  " + SplitBootDetails);
             }
 
@@ -1674,7 +1855,7 @@ namespace PcfixScanner
 
             sb.AppendLine();
             sb.AppendLine("SYSTEM_EVENT_AUDIT_7D:");
-            sb.AppendLine(string.Format("  Disk Bad Blocks (Event ID 7/51/153): {0:N0}", BadBlockTotal));
+            sb.AppendLine(string.Format("  Disk Bad Block Read Retries (Event ID 7/51/153): {0:N0}", BadBlockTotal));
             if (BadBlockTotal > 0)
             {
                 sb.AppendLine("  Target Device: " + BadBlockTargetDevice);
@@ -1700,7 +1881,7 @@ namespace PcfixScanner
                 sb.AppendLine("  Stop Code: " + BugCheckStopCode);
             }
             sb.AppendLine(string.Format("  Display Driver TDR (Event 4101): {0} {1}", DisplayTdrCount, DisplayTdrSummary != "None detected" ? "(" + DisplayTdrSummary + ")" : ""));
-            sb.AppendLine(string.Format("  Corrupted Application Crashes (Event 1000): {0} ({1})", AppCrashes, AppCrashSummary));
+            sb.AppendLine("  Application Crashes (Event 1000 - Software Stability): " + SoftwareStability);
             sb.AppendLine("  MiniDump Crash Archive: " + MiniDumpSummary);
             sb.AppendLine();
             sb.AppendLine("WINDOWS_OS_VERIFICATION:");
@@ -1710,33 +1891,30 @@ namespace PcfixScanner
             sb.AppendLine("  Get-WinEvent -FilterHashtable @{LogName='System'; Id=1001} -MaxEvents 3 | Format-List");
             sb.AppendLine();
             sb.AppendLine("DIAGNOSIS_VERDICT:");
-            if (HasCriticalHardwareFailure)
+            sb.AppendLine("  " + OperationalStatusText);
+            sb.AppendLine("  " + VerdictLabel + ".");
+            sb.AppendLine("  ADVICE: " + VerdictAdvice);
+            if (HasTier1HardwareFault)
             {
-                sb.AppendLine("  CRITICAL HARDWARE FAILURE DETECTED.");
-                if (BadBlockTotal > 0) sb.AppendLine("  - Storage: Physical bad blocks indicate failing media.");
                 if (WheaCount > 0) sb.AppendLine("  - WHEA: Uncorrectable CPU/memory/bus hardware errors logged.");
                 if (MemDiagFailed) sb.AppendLine("  - RAM: Hardware memory fault confirmed by Windows Memory Diagnostic.");
-                if (NtfsCorruptionEvents > 0) sb.AppendLine("  - File System: NTFS volume directory corruption logged. Run chkdsk.");
-                if (PnpDeviceErrors.Exists(p => p.IndexOf("Code 43", StringComparison.OrdinalIgnoreCase) >= 0)) sb.AppendLine("  - Device Manager: Device stopped due to hardware fault (Code 43).");
-                if (!string.IsNullOrEmpty(BugCheckStopCode) && BugCheckStopCode.IndexOf("0x124") >= 0) sb.AppendLine("  - BSOD: WHEA_UNCORRECTABLE_ERROR (hardware fault).");
-                sb.AppendLine("  RECOMMENDATION: Back up personal data immediately. Replace failing component before total failure.");
+                if (Disks.Exists(d => d.IsSsdDeath)) sb.AppendLine("  - Storage: SSD severe wear or predictive failure. Replace the drive.");
+                if (KernelPowerStopCode != null && (KernelPowerStopCode.IndexOf("0x124", StringComparison.OrdinalIgnoreCase) >= 0 || KernelPowerStopCode.IndexOf("0x7A", StringComparison.OrdinalIgnoreCase) >= 0 || KernelPowerStopCode.IndexOf("0x1A", StringComparison.OrdinalIgnoreCase) >= 0))
+                    sb.AppendLine("  - Power: Kernel-Power 41 bugcheck " + KernelPowerStopCode + " indicates hardware fault.");
             }
-            else if (HasWarningCondition)
+            else if (HasTier2Maintenance)
             {
-                sb.AppendLine("  WARNING: Non-critical issues detected.");
-                if (CpuThrottleCount > 0) sb.AppendLine(string.Format("  - CPU: Firmware/Thermal throttling detected ({0} events). Check cooling/thermal paste.", CpuThrottleCount));
-                if (DisplayTdrCount > 0) sb.AppendLine(string.Format("  - Display driver resets (TDR): {0}", DisplayTdrSummary));
-                if (KernelPowerEvents >= 2) sb.AppendLine(string.Format("  - Stability: {0} unexpected shutdowns in 7 days.", KernelPowerEvents));
-                if (BugCheckCount > 0) sb.AppendLine(string.Format("  - BSOD: {0}", BugCheckSummary));
-                if (PnpDeviceErrors.Count > 0) sb.AppendLine(string.Format("  - Device Manager: {0} device faults detected.", PnpDeviceErrors.Count));
-                if (CmosClockDriftDetected) sb.AppendLine("  - Motherboard: Real-time clock reset detected. Replace CR2032 CMOS battery.");
-                if (DeadAutoServices.Count > 0) sb.AppendLine("  - Windows Services: Essential services failed to start: " + string.Join(", ", DeadAutoServices.ToArray()));
-                if (!SsdTrimEnabled) sb.AppendLine("  - Storage: SSD TRIM is disabled. Flash write performance degraded.");
-                if (SplitBootDetected) sb.AppendLine("  - Boot: Split-boot - bootloader and OS on different disks.");
+                if (BadBlockTotal > 0) sb.AppendLine(string.Format("  - Storage: {0:N0} read retries logged. Run chkdsk /r and back up the affected partition.", BadBlockTotal));
+                if (CpuThrottleCount > 0) sb.AppendLine(string.Format("  - CPU: Firmware/Thermal throttling detected ({0} events). Clean cooler or reapply thermal paste.", CpuThrottleCount));
+                if (DisplayTdrCount > 0) sb.AppendLine("  - Display driver resets (TDR). Clean reinstall the GPU driver using DDU.");
+                if (NtfsCorruptionEvents > 0) sb.AppendLine("  - File System: NTFS volume directory corruption logged. Run chkdsk.");
             }
             else
             {
-                sb.AppendLine("  SYSTEM NOMINAL: No bad blocks, no WHEA faults, no BugChecks, and clean shutdowns detected.");
+                if (SplitBootDetected) sb.AppendLine("  - Boot: Split-boot layout note. Boot files on a secondary drive. Keep both drives connected.");
+                if (XmpDisabledSuspected) sb.AppendLine("  - Memory: XMP/EXPO disabled. Enable in BIOS for a bandwidth boost (optional).");
+                if (CmosClockDriftDetected) sb.AppendLine("  - Motherboard: RTC clock drift. Replace CR2032 coin cell.");
+                if (!SplitBootDetected && !XmpDisabledSuspected && !CmosClockDriftDetected) sb.AppendLine("  SYSTEM NOMINAL: No hardware faults detected.");
             }
             sb.AppendLine("================================");
             return sb.ToString();
@@ -1760,6 +1938,7 @@ namespace PcfixScanner
         private SolidColorBrush _colorOk = new SolidColorBrush(Color.FromRgb(63, 185, 80)); // #3fb950
         private SolidColorBrush _colorWarn = new SolidColorBrush(Color.FromRgb(210, 153, 34)); // #d29922
         private SolidColorBrush _colorCritical = new SolidColorBrush(Color.FromRgb(248, 81, 73)); // #f85149
+        private SolidColorBrush _colorDegraded = new SolidColorBrush(Color.FromRgb(219, 109, 40)); // orange 45-64 tier
 
         // Theme dynamic brushes
         private bool _isDarkMode = true;
@@ -3176,7 +3355,7 @@ namespace PcfixScanner
                 }
                 if (report.SplitBootDetected)
                 {
-                    AppendLog("WARN", "Boot architecture: " + report.SplitBootDetails);
+                    AppendLog("INFO", "Boot configuration: " + report.SplitBootDetails);
                 }
 
                 if (report.BadBlockTotal > 0)
@@ -3258,7 +3437,15 @@ namespace PcfixScanner
 
                 ReportProgress(100, "Diagnostic scan complete");
                 AppendLog("DONE", "Telemetry assembled successfully");
-                AppendLog("SCORE", string.Format("pcfix Score: {0}/100 ({1})", report.PcfixScore, report.PcfixScoreLabel));
+                AppendLog("SCORE", string.Format("pcfix Score: {0}/100 ({1}) [{2}]", report.PcfixScore, report.PcfixScoreLabel, report.PcfixTier));
+                if (!string.IsNullOrEmpty(report.OperationalStatusText))
+                {
+                    AppendLog("INFO", report.OperationalStatusText);
+                }
+                if (!string.IsNullOrEmpty(report.VerdictLabel))
+                {
+                    AppendLog(report.HasTier1HardwareFault ? "CRIT" : "INFO", report.VerdictLabel + ". " + report.VerdictAdvice);
+                }
                 if (report.XmpDisabledSuspected)
                 {
                     AppendLog("WARN", report.XmpSummary);
@@ -4134,7 +4321,7 @@ namespace PcfixScanner
                     string efiModel = diskMap.ContainsKey(activeEspDiskIndex) ? diskMap[activeEspDiskIndex].Model : "Disk " + activeEspDiskIndex;
                     string osModel = diskMap.ContainsKey(osDiskIndex) ? diskMap[osDiskIndex].Model : "Disk " + osDiskIndex;
                     rep.SplitBootDetails = string.Format(
-                        "Active bootloader (EFI System Partition) is on Disk {0} ({1}), but Windows {2} is on Disk {3} ({4}). Removing or wiping Disk {0} will make Windows unbootable.{5}",
+                        "Boot Configuration Note: the active bootloader (EFI System Partition) is on Disk {0} ({1}), while Windows {2} is on Disk {3} ({4}). System boots normally; keep both drives connected.{5}",
                         activeEspDiskIndex, efiModel, sysDrive, osDiskIndex, osModel,
                         storageNamespaceOk ? "" : " (Detected via Win32_DiskPartition fallback.)");
                 }
@@ -4253,7 +4440,7 @@ namespace PcfixScanner
 
                 if (rep.BadBlockTotal > 0)
                 {
-                    rep.StorageDetail = string.Format("{0:N0} Bad Blocks | Critical", rep.BadBlockTotal);
+                    rep.StorageDetail = string.Format("{0:N0} Read Retries | Maintenance", rep.BadBlockTotal);
                 }
             }
             catch { }
@@ -5261,10 +5448,10 @@ namespace PcfixScanner
             if (_sysInfoText != null) _sysInfoText.Text = boardStr;
             if (_osInfoText != null) _osInfoText.Text = !string.IsNullOrEmpty(r.Os) ? r.Os : "Microsoft Windows (64-bit)";
 
-            // Phase 3: Update score badge colors
+            // Phase 3: Update score badge colors (4-tier scale)
             if (_scoreBadge != null && _scoreBadgeText != null)
             {
-                SolidColorBrush badgeColor = r.PcfixScore >= 90 ? _colorOk : (r.PcfixScore >= 70 ? _colorWarn : _colorCritical);
+                SolidColorBrush badgeColor = r.PcfixScore >= 85 ? _colorOk : (r.PcfixScore >= 65 ? _colorWarn : (r.PcfixScore >= 45 ? _colorDegraded : _colorCritical));
                 _scoreBadgeText.Foreground = badgeColor;
                 _scoreBadgeText.Text = string.Format("pcfix Score: {0}/100 ({1})", r.PcfixScore, r.PcfixScoreLabel);
                 _scoreBadge.Background = new SolidColorBrush(Color.FromArgb(25, badgeColor.Color.R, badgeColor.Color.G, badgeColor.Color.B));
@@ -5287,15 +5474,15 @@ namespace PcfixScanner
             _ramSub.Foreground = _colorOk;
 
             _storageTitle.Text = !string.IsNullOrEmpty(r.StorageName) ? r.StorageName : r.StorageSummary;
-            if (r.BadBlockTotal > 0)
-            {
-                _storageSub.Text = string.Format("{0:N0} Bad Blocks | Critical", r.BadBlockTotal);
-                _storageSub.Foreground = _colorCritical;
-            }
-            else if (r.Disks.Exists(d => d.SmartHealthStatus == "Unhealthy" || (d.SmartReadErrorsUncorrected ?? 0) > 0))
+            if (r.Disks.Exists(d => d.IsSsdDeath))
             {
                 _storageSub.Text = "SMART Failure | Critical";
                 _storageSub.Foreground = _colorCritical;
+            }
+            else if (r.BadBlockTotal > 0)
+            {
+                _storageSub.Text = string.Format("{0:N0} Read Retries | Maintenance", r.BadBlockTotal);
+                _storageSub.Foreground = _colorDegraded;
             }
             else if (r.Disks.Exists(d => d.Status != "OK" || d.SmartHealthStatus == "Warning"))
             {
@@ -5308,8 +5495,8 @@ namespace PcfixScanner
                 _storageSub.Foreground = _colorOk;
             }
 
-            // Status Alert Card
-            if (r.HasCriticalHardwareFailure)
+            // Status Alert Card (three-tier severity)
+            if (r.HasTier1HardwareFault)
             {
                 _alertCard.Background = new SolidColorBrush(Color.FromArgb(40, 248, 81, 73));
                 _alertCard.BorderBrush = _colorCritical;
@@ -5320,27 +5507,10 @@ namespace PcfixScanner
                 List<string> failureReasons = new List<string>();
                 List<string> failureDetails = new List<string>();
 
-                if (r.BadBlockTotal > 0)
-                {
-                    failureReasons.Add(string.Format("{0:N0} Storage Bad Blocks", r.BadBlockTotal));
-                    string failingDisk = "";
-                    foreach (DiskItem d in r.Disks)
-                    {
-                        if (d.IsFailing) failingDisk += string.Format("Disk {0} ({1}) ", d.Index, d.Model);
-                    }
-                    failureDetails.Add(string.Format("Physical storage bad blocks logged on {0} ({1}). Storage sectors are damaged. Backup personal data immediately.", r.BadBlockTargetDevice, failingDisk.Trim()));
-                }
-
                 if (r.WheaCount > 0)
                 {
                     failureReasons.Add(string.Format("{0} WHEA Hardware Errors", r.WheaCount));
-                    failureDetails.Add(string.Format("Windows Hardware Error Architecture (WHEA) logged uncorrectable hardware error events ({0}). Processor or system bus instability indicated.", r.WheaSummary));
-                }
-
-                if (!string.IsNullOrEmpty(r.BugCheckStopCode) && (r.BugCheckStopCode.IndexOf("0x124") >= 0 || r.BugCheckStopCode.IndexOf("0x7A") >= 0))
-                {
-                    failureReasons.Add("Critical BSOD (" + r.BugCheckStopCode + ")");
-                    failureDetails.Add("System crashed with critical kernel stop code: " + r.BugCheckStopCode + ".");
+                    failureDetails.Add(string.Format("Windows Hardware Error Architecture (WHEA) logged uncorrectable machine check events ({0}). Processor or system bus instability indicated.", r.WheaSummary));
                 }
 
                 if (r.MemDiagFailed)
@@ -5349,93 +5519,54 @@ namespace PcfixScanner
                     failureDetails.Add("Windows Memory Diagnostic confirmed defective physical DRAM.");
                 }
 
-                if (r.NtfsCorruptionEvents > 0)
+                if (!string.IsNullOrEmpty(r.KernelPowerStopCode) && (r.KernelPowerStopCode.IndexOf("0x124", StringComparison.OrdinalIgnoreCase) >= 0 || r.KernelPowerStopCode.IndexOf("0x7A", StringComparison.OrdinalIgnoreCase) >= 0 || r.KernelPowerStopCode.IndexOf("0x1A", StringComparison.OrdinalIgnoreCase) >= 0))
                 {
-                    failureReasons.Add("NTFS Directory Corruption");
-                    failureDetails.Add("NTFS event log records directory corruption. Run chkdsk.");
-                }
-
-                if (r.PnpDeviceErrors.Exists(p => p.IndexOf("Code 43", StringComparison.OrdinalIgnoreCase) >= 0))
-                {
-                    failureReasons.Add("Device Manager Code 43");
-                    failureDetails.Add("A hardware device was stopped by Windows due to hardware failure (Code 43).");
+                    failureReasons.Add("Critical BSOD (" + r.KernelPowerStopCode + ")");
+                    failureDetails.Add("System crashed with critical kernel stop code: " + r.KernelPowerStopCode + ".");
                 }
 
                 foreach (DiskItem d in r.Disks)
                 {
-                    if ((d.SmartHealthStatus == "Unhealthy" || (d.SmartReadErrorsUncorrected ?? 0) > 0) && r.BadBlockTotal == 0)
+                    if (d.IsSsdDeath)
                     {
-                        failureReasons.Add(string.Format("Disk {0} SMART Failure ({1})", d.Index, d.SmartHealthStatus));
-                        failureDetails.Add(string.Format("Drive {0} ({1}) reports real SMART health status \"{2}\" with {3} uncorrected read errors. This is hardware-reported, not just a Windows status flag.",
-                            d.Index, d.Model, d.SmartHealthStatus, d.SmartReadErrorsUncorrected ?? 0));
-                    }
-                    else if (d.Status != "OK" && r.BadBlockTotal == 0)
-                    {
-                        failureReasons.Add(string.Format("Disk {0} Status Failure ({1})", d.Index, d.Status));
-                        failureDetails.Add(string.Format("Drive {0} ({1}) reports failing Windows disk status: {2}.", d.Index, d.Model, d.Status));
+                        failureReasons.Add(string.Format("Disk {0} SSD Failure", d.Index));
+                        failureDetails.Add(string.Format("Drive {0} ({1}) reports severe wear or predictive failure. Replace the drive.", d.Index, d.Model));
                     }
                 }
 
-                _alertHeading.Text = string.Format("CRITICAL HARDWARE FAULT ({0})", string.Join(", ", failureReasons.ToArray()));
+                _alertHeading.Text = "CRITICAL HARDWARE FAILURE DETECTED";
                 _alertHeading.Foreground = _colorCritical;
-                _alertDesc.Text = string.Join(" ", failureDetails.ToArray()) + " IMMEDIATE DATA BACKUP RECOMMENDED.";
+                _alertDesc.Text = string.Join(" ", failureDetails.ToArray()) + " Replace defective component before total failure. Back up critical personal files immediately.";
             }
-            else if (r.HasWarningCondition)
+            else if (r.HasTier2Maintenance)
             {
-                _alertCard.Background = new SolidColorBrush(Color.FromArgb(30, 210, 153, 34));
-                _alertCard.BorderBrush = _colorWarn;
-                _alertIconBox.Background = new SolidColorBrush(Color.FromArgb(50, 210, 153, 34));
-                _alertIconText.Foreground = _colorWarn;
+                _alertCard.Background = new SolidColorBrush(Color.FromArgb(30, 219, 109, 40));
+                _alertCard.BorderBrush = _colorDegraded;
+                _alertIconBox.Background = new SolidColorBrush(Color.FromArgb(50, 219, 109, 40));
+                _alertIconText.Foreground = _colorDegraded;
                 _alertIconText.Text = "!";
-                _alertHeading.Text = "System Warnings Detected";
-                _alertHeading.Foreground = _colorWarn;
+                _alertHeading.Text = r.VerdictLabel;
+                _alertHeading.Foreground = _colorDegraded;
 
                 List<string> warnDetails = new List<string>();
+                if (r.BadBlockTotal > 0)
+                {
+                    warnDetails.Add(string.Format("{0:N0} bad block read retries logged on {1}. File corruption or isolated bad sectors. Run chkdsk /r and back up the affected partition.", r.BadBlockTotal, r.BadBlockTargetDevice));
+                }
                 if (r.CpuThrottleCount > 0)
                 {
-                    warnDetails.Add(string.Format("CPU firmware/thermal throttling logged ({0} times). Check thermal paste/fans.", r.CpuThrottleCount));
+                    warnDetails.Add(string.Format("CPU thermal/firmware throttling logged ({0} times). Clean cooler heatsink or re-apply thermal paste.", r.CpuThrottleCount));
                 }
                 if (r.DisplayTdrCount > 0)
                 {
-                    warnDetails.Add(string.Format("{0} display driver resets (TDR Event 4101: {1}).", r.DisplayTdrCount, r.DisplayTdrSummary));
+                    warnDetails.Add(string.Format("{0} display driver resets (TDR Event 4101: {1}). Clean reinstall the GPU driver using DDU.", r.DisplayTdrCount, r.DisplayTdrSummary));
                 }
-                if (r.KernelPowerEvents >= 2)
+                if (r.NtfsCorruptionEvents > 0)
                 {
-                    warnDetails.Add(string.Format("{0} unexpected freeze shutdowns (Kernel-Power 41).", r.KernelPowerEvents));
-                }
-                if (r.BugCheckCount > 0 && (string.IsNullOrEmpty(r.BugCheckStopCode) || (r.BugCheckStopCode.IndexOf("0x124") < 0 && r.BugCheckStopCode.IndexOf("0x7A") < 0)))
-                {
-                    warnDetails.Add(string.Format("BSOD crash recorded: {0}.", !string.IsNullOrEmpty(r.BugCheckStopCode) ? r.BugCheckStopCode : r.BugCheckSummary));
-                }
-                if (r.PnpDeviceErrors.Count > 0)
-                {
-                    warnDetails.Add(string.Format("Device Manager reported {0} device faults: {1}.", r.PnpDeviceErrors.Count, string.Join(", ", r.PnpDeviceErrors.ToArray())));
-                }
-                if (r.CmosClockDriftDetected)
-                {
-                    warnDetails.Add("Motherboard real-time clock reset detected. Replace CR2032 coin cell battery.");
-                }
-                if (r.DeadAutoServices.Count > 0)
-                {
-                    warnDetails.Add("Essential services stopped: " + string.Join(", ", r.DeadAutoServices.ToArray()) + ".");
-                }
-                if (!r.SsdTrimEnabled)
-                {
-                    warnDetails.Add("SSD TRIM garbage collection is disabled.");
-                }
-                if (r.SplitBootDetected)
-                {
-                    warnDetails.Add(r.SplitBootDetails);
-                }
-                foreach (DiskItem d in r.Disks)
-                {
-                    if (d.Status != "OK")
-                    {
-                        warnDetails.Add(string.Format("Drive {0} ({1}) status is {2}.", d.Index, d.Model, d.Status));
-                    }
+                    warnDetails.Add("NTFS volume directory corruption logged. Run chkdsk.");
                 }
 
-                _alertDesc.Text = warnDetails.Count > 0 ? string.Join(" ", warnDetails.ToArray()) : "Non-critical hardware warnings detected.";
+                _alertDesc.Text = warnDetails.Count > 0 ? string.Join(" ", warnDetails.ToArray()) : "Maintenance recommended.";
             }
             else
             {
@@ -5444,9 +5575,9 @@ namespace PcfixScanner
                 _alertIconBox.Background = new SolidColorBrush(Color.FromArgb(50, 63, 185, 80));
                 _alertIconText.Foreground = _colorOk;
                 _alertIconText.Text = "✓";
-                _alertHeading.Text = "System Nominal - All Hardware Checks Passed";
+                _alertHeading.Text = string.IsNullOrEmpty(r.VerdictLabel) ? "System Nominal - All Hardware Checks Passed" : r.VerdictLabel;
                 _alertHeading.Foreground = _colorOk;
-                _alertDesc.Text = "Zero disk bad blocks, zero WHEA hardware faults, zero BSOD crashes, and normal drive SMART health verified.";
+                _alertDesc.Text = string.IsNullOrEmpty(r.VerdictAdvice) ? "Zero WHEA faults, zero RAM failures, no SSD death, and normal drive SMART health verified." : r.VerdictAdvice;
             }
 
             _disksContainer.Children.Clear();
@@ -5468,9 +5599,9 @@ namespace PcfixScanner
                     r.SystemReliabilityScore >= 8.0 ? _colorOk : (r.SystemReliabilityScore >= 5.0 ? _colorWarn : _colorCritical)));
             }
 
-            _eventMetricsPanel.Children.Add(CreateEventRow("Disk Bad Blocks (Event ID 7/51/153):", 
-                r.BadBlockTotal > 0 ? string.Format("{0:N0} events ({1})", r.BadBlockTotal, r.BadBlockTargetDevice) : "0 detected (Nominal)", 
-                r.BadBlockTotal > 0 ? _colorCritical : _colorOk));
+            _eventMetricsPanel.Children.Add(CreateEventRow("Disk Bad Block Read Retries (Event ID 7/51/153):", 
+                r.BadBlockTotal > 0 ? string.Format("{0:N0} read retries ({1})", r.BadBlockTotal, r.BadBlockTargetDevice) : "0 detected (Nominal)", 
+                r.BadBlockTotal > 0 ? _colorDegraded : _colorOk));
 
             _eventMetricsPanel.Children.Add(CreateEventRow("WHEA Hardware Errors (Event 18/19/47):", 
                 r.WheaCount > 0 ? string.Format("{0} events ({1})", r.WheaCount, r.WheaSummary) : "0 detected (Nominal)", 
@@ -5504,7 +5635,7 @@ namespace PcfixScanner
                 r.LowMemoryEvents > 0 ? string.Format("{0} OOM events ({1})", r.LowMemoryEvents, r.LowMemorySummary) : "0 detected (Nominal)", 
                 r.LowMemoryEvents > 0 ? _colorWarn : _colorOk));
 
-            _eventMetricsPanel.Children.Add(CreateEventRow("Corrupted Application Crashes (Event 1000):", 
+            _eventMetricsPanel.Children.Add(CreateEventRow("Software Stability (App Crashes, Event 1000):", 
                 r.AppCrashes > 0 ? string.Format("{0} ({1})", r.AppCrashes, r.AppCrashSummary) : "0 detected (Nominal)", 
                 r.AppCrashes > 0 ? _colorWarn : _colorOk));
 
@@ -5844,11 +5975,12 @@ namespace PcfixScanner
 
         private UIElement CreateDiskAuditCard(DiskItem d)
         {
+            SolidColorBrush accent = d.IsSsdDeath ? _colorCritical : (d.HasReadRetries ? _colorDegraded : _colorOk);
             Border b = new Border
             {
                 Background = _bgCard,
-                BorderBrush = d.IsFailing ? _colorCritical : _borderLine,
-                BorderThickness = new Thickness(d.IsFailing ? 1.5 : 1),
+                BorderBrush = d.IsSsdDeath ? _colorCritical : (d.HasReadRetries ? _colorDegraded : _borderLine),
+                BorderThickness = new Thickness(d.IsSsdDeath ? 1.5 : 1),
                 CornerRadius = new CornerRadius(12),
                 Padding = new Thickness(12),
                 Margin = new Thickness(0, 0, 0, 6)
@@ -5909,8 +6041,8 @@ namespace PcfixScanner
 
             Border badge = new Border
             {
-                Background = d.IsFailing ? new SolidColorBrush(Color.FromArgb(40, 248, 81, 73)) : new SolidColorBrush(Color.FromArgb(30, 63, 185, 80)),
-                BorderBrush = d.IsFailing ? _colorCritical : _colorOk,
+                Background = d.IsSsdDeath ? new SolidColorBrush(Color.FromArgb(40, 248, 81, 73)) : (d.HasReadRetries ? new SolidColorBrush(Color.FromArgb(30, 219, 109, 40)) : new SolidColorBrush(Color.FromArgb(30, 63, 185, 80))),
+                BorderBrush = accent,
                 BorderThickness = new Thickness(1),
                 CornerRadius = new CornerRadius(8),
                 Padding = new Thickness(8, 3, 8, 3),
@@ -5921,7 +6053,7 @@ namespace PcfixScanner
                 Text = d.GetHealthBadge(),
                 FontSize = 10.5,
                 FontWeight = FontWeights.Bold,
-                Foreground = d.IsFailing ? _colorCritical : _colorOk
+                Foreground = accent
             };
             g.Children.Add(badge);
             Grid.SetColumn(badge, 1);
@@ -5934,8 +6066,8 @@ namespace PcfixScanner
         {
             Border b = new Border
             {
-                Background = new SolidColorBrush(Color.FromArgb(20, 210, 153, 34)),
-                BorderBrush = new SolidColorBrush(Color.FromArgb(70, 210, 153, 34)),
+                Background = new SolidColorBrush(Color.FromArgb(20, 88, 166, 255)),
+                BorderBrush = new SolidColorBrush(Color.FromArgb(70, 88, 166, 255)),
                 BorderThickness = new Thickness(1),
                 CornerRadius = new CornerRadius(10),
                 Padding = new Thickness(10),
@@ -5944,15 +6076,15 @@ namespace PcfixScanner
             StackPanel sp = new StackPanel();
             sp.Children.Add(new TextBlock
             {
-                Text = "! Split-Boot Setup Notice",
+                Text = "Boot Configuration Note: Split-Boot Layout",
                 FontWeight = FontWeights.Bold,
                 FontSize = 11,
-                Foreground = _colorWarn,
+                Foreground = _accent,
                 Margin = new Thickness(0, 0, 0, 2)
             });
             sp.Children.Add(new TextBlock
             {
-                Text = details + " If you replace the failing Windows drive, the bootloader on the other drive must remain intact.",
+                Text = details + " System boots and operates normally. Boot files reside on a secondary drive. Ensure both drives stay connected.",
                 FontSize = 10.5,
                 Foreground = _textSecondary,
                 TextWrapping = TextWrapping.Wrap
